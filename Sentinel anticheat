@@ -1,5 +1,5 @@
--- Sentinel Anti-Cheat
--- Server-side movement, physics and RemoteEvent validation.
+-- sentinel anti cheat
+-- ss movement physics and RemoteEvent validation.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
