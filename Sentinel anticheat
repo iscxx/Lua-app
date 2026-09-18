@@ -1,5 +1,5 @@
--- that is a server-side anti-cheat built around several independent checks.
--- The important part is that the client never gets to decide whether a check passes.
+-- Sentinel Anti-Cheat
+-- Server-side movement, physics and RemoteEvent validation.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -13,62 +13,60 @@ local CONFIG = {
 	MaxSpeed = 42,
 	MaxVerticalSpeed = 115,
 	MaxTeleportDistance = 65,
-	StrikeLimit = 6,
+	MaxStrikes = 6,
+
 	RemoteLimit = 25,
 	RemoteWindow = 2,
 	StrikeDecay = 30,
 	SpawnGrace = 3,
 	CheckInterval = 0.15,
+
 	Debug = true
 }
 
-local REMOTE_FOLDER = "SentinelRemotes"
-local REMOTE_NAME = "Request"
-local CHARACTER_TAG = "SentinelProtected"
+local states = {}
 
-local folder = ReplicatedStorage:FindFirstChild(REMOTE_FOLDER)
+local remotes = ReplicatedStorage:FindFirstChild("SentinelRemotes")
 
-if not folder then
-	folder = Instance.new("Folder")
-	folder.Name = REMOTE_FOLDER
-	folder.Parent = ReplicatedStorage
+if not remotes then
+	remotes = Instance.new("Folder")
+	remotes.Name = "SentinelRemotes"
+	remotes.Parent = ReplicatedStorage
 end
 
-local remote = folder:FindFirstChild(REMOTE_NAME)
+local request = remotes:FindFirstChild("Request")
 
-if not remote then
-	remote = Instance.new("RemoteEvent")
-	remote.Name = REMOTE_NAME
-	remote.Parent = folder
+if not request then
+	request = Instance.new("RemoteEvent")
+	request.Name = "Request"
+	request.Parent = remotes
 end
 
--- A metatable keeps all information belonging to a player in one object.
-local State = {}
-State.__index = State
+-- Each player gets an isolated state object instead of several global tables.
+local PlayerState = {}
+PlayerState.__index = PlayerState
 
-function State.new(player)
-	local self = setmetatable({}, State)
+function PlayerState.new(player)
+	local self = setmetatable({}, PlayerState)
 
 	self.Player = player
 	self.LastPosition = nil
 	self.LastCheck = os.clock()
 	self.LastDecay = os.clock()
 	self.Strikes = 0
+
 	self.AirStart = nil
 	self.RemoteCalls = {}
 	self.RemoteWindow = os.clock()
+	self.TeleportGrace = os.clock() + CONFIG.SpawnGrace
+
 	self.Connections = {}
-	self.TeleportGrace = 0
 	self.Destroyed = false
 
 	return self
 end
 
-function State:AddConnection(connection)
-	table.insert(self.Connections, connection)
-end
-
-function State:Strike(reason, amount)
+function PlayerState:Strike(reason, amount)
 	if self.Destroyed then
 		return
 	end
@@ -88,14 +86,14 @@ function State:Strike(reason, amount)
 		self.Strikes
 	)
 
-	if self.Strikes >= CONFIG.StrikeLimit then
+	if self.Strikes >= CONFIG.MaxStrikes then
 		self.Player:Kick(
 			"Sentinel: suspicious activity detected."
 		)
 	end
 end
 
-function State:Decay()
+function PlayerState:Decay()
 	local now = os.clock()
 
 	if now - self.LastDecay < CONFIG.StrikeDecay then
@@ -113,16 +111,16 @@ function State:Decay()
 	end
 end
 
-function State:AllowTeleport(duration)
+function PlayerState:AllowTeleport(duration)
 	self.TeleportGrace =
 		os.clock() + (duration or 1.5)
 end
 
-function State:IsInGrace()
+function PlayerState:IsInGrace()
 	return os.clock() < self.TeleportGrace
 end
 
-function State:Destroy()
+function PlayerState:Destroy()
 	if self.Destroyed then
 		return
 	end
@@ -137,12 +135,11 @@ function State:Destroy()
 
 	table.clear(self.Connections)
 	table.clear(self.RemoteCalls)
+
 	self.LastPosition = nil
 end
 
-local states = {}
-
-local function getParts(player)
+local function getCharacter(player)
 	local character = player.Character
 
 	if not character then
@@ -159,15 +156,11 @@ local function getParts(player)
 		return
 	end
 
-	if not root:IsA("BasePart") then
-		return
-	end
-
 	return character, humanoid, root
 end
 
--- The raycast uses the server physics world instead of trusting the client.
-local function grounded(character, root)
+-- Server-side raycasting gives us the actual physics state of the character.
+local function isGrounded(character, root)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = {character}
@@ -188,6 +181,7 @@ local function checkMovement(state, character, humanoid, root)
 		return
 	end
 
+	local elapsed = now - state.LastCheck
 	state.LastCheck = now
 
 	if state:IsInGrace() then
@@ -202,100 +196,85 @@ local function checkMovement(state, character, humanoid, root)
 		return
 	end
 
-	local delta = root.Position - previous
-	local distance = delta.Magnitude
+	local displacement = root.Position - previous
+	local distance = displacement.Magnitude
 
-	-- CFrame gives us the direction of travel, while Vector3 handles the
-	-- actual distance and velocity calculations.
+	-- A large server-side position jump is handled separately from speed.
 	if distance > CONFIG.MaxTeleportDistance then
 		state:Strike(
-			"Large position delta: "
-				.. math.floor(distance),
+			"Large position delta: " .. math.floor(distance),
 			2
 		)
-
 		return
 	end
 
-	local horizontal =
-		Vector3.new(
-			delta.X,
-			0,
-			delta.Z
-		)
+	local horizontal = Vector3.new(
+		displacement.X,
+		0,
+		displacement.Z
+	)
 
-	local speed =
-		horizontal.Magnitude / CONFIG.CheckInterval
+	local measuredSpeed =
+		horizontal.Magnitude / math.max(elapsed, 0.01)
 
-	local velocity =
-		root.AssemblyLinearVelocity
+	local velocity = root.AssemblyLinearVelocity
 
-	local horizontalVelocity =
-		Vector3.new(
-			velocity.X,
-			0,
-			velocity.Z
-		)
+	local horizontalVelocity = Vector3.new(
+		velocity.X,
+		0,
+		velocity.Z
+	)
 
-	if speed > CONFIG.MaxSpeed
+	if measuredSpeed > CONFIG.MaxSpeed
 		and not humanoid.Sit
 	then
 		state:Strike(
-			"Abnormal movement speed: "
-				.. math.floor(speed)
+			"Movement speed: " .. math.floor(measuredSpeed)
 		)
 	end
 
-	if horizontalVelocity.Magnitude
-		> CONFIG.MaxSpeed
+	if horizontalVelocity.Magnitude > CONFIG.MaxSpeed
 		and not humanoid.Sit
 	then
 		state:Strike(
-			"Abnormal assembly velocity: "
-				.. math.floor(
-					horizontalVelocity.Magnitude
-				)
+			"Assembly velocity: "
+				.. math.floor(horizontalVelocity.Magnitude)
 		)
 	end
 
-	if math.abs(velocity.Y)
-		> CONFIG.MaxVerticalSpeed
-	then
-		state:Strike(
-			"Abnormal vertical velocity"
-		)
+	if math.abs(velocity.Y) > CONFIG.MaxVerticalSpeed then
+		state:Strike("Vertical velocity detected")
 	end
 
-	-- Comparing travel direction with velocity catches some unnatural
-	-- position manipulation without relying on one absolute speed value.
+	-- CFrame.LookVector lets us compare where the player moved with the
+	-- direction their physical velocity says they were moving.
 	if horizontal.Magnitude > 4
 		and horizontalVelocity.Magnitude > 4
 	then
-		local travelCFrame =
-			CFrame.lookAt(
-				root.Position - delta,
-				root.Position
-			)
+		local travel = CFrame.lookAt(
+			previous,
+			root.Position
+		)
 
 		local alignment =
-			travelCFrame.LookVector:Dot(
+			travel.LookVector:Dot(
 				horizontalVelocity.Unit
 			)
 
 		if alignment < -0.8 then
 			state:Strike(
-				"Movement/velocity mismatch"
+				"Movement and velocity mismatch"
 			)
 		end
 	end
 end
 
-local function checkAirTime(state, character, humanoid, root)
+local function checkAirTime(state, character, root)
 	if state:IsInGrace() then
 		return
 	end
 
-	if grounded(character, root) then
+	if isGrounded(character, root) then
 		state.AirStart = nil
 		return
 	end
@@ -309,13 +288,11 @@ local function checkAirTime(state, character, humanoid, root)
 	local velocity =
 		root.AssemblyLinearVelocity
 
-	-- A player can naturally be airborne, so this only becomes suspicious
-	-- when they remain suspended while vertical velocity is almost zero.
 	if airTime > 5
 		and math.abs(velocity.Y) < 2
 	then
 		state:Strike(
-			"Extended airborne state"
+			"Suspicious suspended movement"
 		)
 
 		state.AirStart = os.clock()
@@ -341,12 +318,11 @@ local function checkNoclip(state, character, root)
 	local hits = 0
 
 	for _, direction in ipairs(directions) do
-		local result =
-			Workspace:Raycast(
-				root.Position,
-				direction,
-				params
-			)
+		local result = Workspace:Raycast(
+			root.Position,
+			direction,
+			params
+		)
 
 		if result
 			and result.Instance:IsA("BasePart")
@@ -357,11 +333,9 @@ local function checkNoclip(state, character, root)
 	end
 
 	if hits >= 3
-		and not grounded(character, root)
+		and not isGrounded(character, root)
 	then
-		state:Strike(
-			"Suspicious collision state"
-		)
+		state:Strike("Suspicious collision state")
 	end
 end
 
@@ -394,46 +368,37 @@ local function validatePayload(payload)
 			return false
 		end
 
-		if valueType == "number" then
-			if value ~= value
-				or value == math.huge
-				or value == -math.huge
-			then
-				return false
-			end
+		if valueType == "number"
+			and (value ~= value
+			or value == math.huge
+			or value == -math.huge)
+		then
+			return false
 		end
 	end
 
 	return true
 end
 
--- Remote traffic is treated as untrusted input. The server decides what
--- actions exist and how frequently they can be requested.
+-- RemoteEvents are treated as untrusted input. The client only requests;
+-- the server decides what is actually allowed.
 local function checkRemoteRate(state)
 	local now = os.clock()
 
-	if now - state.RemoteWindow
-		>= CONFIG.RemoteWindow
-	then
+	if now - state.RemoteWindow >= CONFIG.RemoteWindow then
 		state.RemoteWindow = now
 		table.clear(state.RemoteCalls)
 	end
 
-	if #state.RemoteCalls
-		>= CONFIG.RemoteLimit
-	then
+	if #state.RemoteCalls >= CONFIG.RemoteLimit then
 		state:Strike(
 			"Remote rate limit exceeded",
 			2
 		)
-
 		return false
 	end
 
-	table.insert(
-		state.RemoteCalls,
-		now
-	)
+	table.insert(state.RemoteCalls, now)
 
 	return true
 end
@@ -452,42 +417,27 @@ local function handleRemote(player, action, payload)
 	if typeof(action) ~= "string"
 		or #action > 40
 	then
-		state:Strike(
-			"Invalid remote action"
-		)
-
+		state:Strike("Invalid remote action")
 		return
 	end
 
 	if not validatePayload(payload) then
-		state:Strike(
-			"Invalid remote payload"
-		)
-
+		state:Strike("Invalid remote payload")
 		return
 	end
 
 	if action == "Ping" then
-		remote:FireClient(
-			player,
-			"Pong"
-		)
-
+		request:FireClient(player, "Pong")
 		return
 	end
 
 	if action == "Debug" then
-		if not player:GetAttribute(
-			"SentinelAdmin"
-		) then
-			state:Strike(
-				"Unauthorized debug request"
-			)
-
+		if not player:GetAttribute("SentinelAdmin") then
+			state:Strike("Unauthorized debug request")
 			return
 		end
 
-		remote:FireClient(
+		request:FireClient(
 			player,
 			"Debug",
 			{
@@ -503,20 +453,16 @@ local function handleRemote(player, action, payload)
 	)
 end
 
-remote.OnServerEvent:Connect(function(player, action, payload)
-	local success, errorMessage =
-		pcall(
-			handleRemote,
-			player,
-			action,
-			payload
-		)
+request.OnServerEvent:Connect(function(player, action, payload)
+	local success, err = pcall(
+		handleRemote,
+		player,
+		action,
+		payload
+	)
 
 	if not success then
-		warn(
-			"[Sentinel] Remote error:",
-			errorMessage
-		)
+		warn("[Sentinel] Remote error:", err)
 	end
 end)
 
@@ -528,16 +474,10 @@ local function setupCharacter(player, character)
 	end
 
 	local humanoid =
-		character:WaitForChild(
-			"Humanoid",
-			8
-		)
+		character:WaitForChild("Humanoid", 8)
 
 	local root =
-		character:WaitForChild(
-			"HumanoidRootPart",
-			8
-		)
+		character:WaitForChild("HumanoidRootPart", 8)
 
 	if not humanoid or not root then
 		return
@@ -550,12 +490,12 @@ local function setupCharacter(player, character)
 
 	if not CollectionService:HasTag(
 		character,
-		CHARACTER_TAG
+		"SentinelProtected"
 	) then
 		CollectionService:AddTag(
 			character,
-			CHARACTER_TAG
-		)
+			"SentinelProtected"
+	)
 	end
 end
 
@@ -564,7 +504,7 @@ local function addPlayer(player)
 		return
 	end
 
-	local state = State.new(player)
+	local state = PlayerState.new(player)
 	states[player.UserId] = state
 
 	player:SetAttribute(
@@ -595,13 +535,6 @@ local function addPlayer(player)
 			player.Character
 		)
 	end
-
-	if CONFIG.Debug then
-		print(
-			"[Sentinel] Monitoring",
-			player.Name
-		)
-	end
 end
 
 Players.PlayerAdded:Connect(addPlayer)
@@ -615,8 +548,8 @@ Players.PlayerRemoving:Connect(function(player)
 	end
 end)
 
--- Registering a collision group is useful for larger games that want
--- Sentinel-protected characters to interact with custom physics rules.
+-- PhysicsService is included so the system can be extended with dedicated
+-- collision groups without changing the rest of the architecture.
 pcall(function()
 	PhysicsService:RegisterCollisionGroup(
 		"SentinelProtected"
@@ -633,8 +566,6 @@ Workspace:SetAttribute(
 	HttpService:GenerateGUID(false)
 )
 
--- The loop stays lightweight: movement is checked every few frames while
--- the more expensive physics checks run less often.
 RunService.Heartbeat:Connect(function()
 	for _, state in pairs(states) do
 		if state.Destroyed then
@@ -643,48 +574,39 @@ RunService.Heartbeat:Connect(function()
 
 		local player = state.Player
 
-		if not player
-			or not player.Parent
-		then
+		if not player or not player.Parent then
 			continue
 		end
 
-		local character,
-			humanoid,
-			root =
-			getParts(player)
+		local character, humanoid, root =
+			getCharacter(player)
 
-		if character
-			and humanoid
-			and root
-		then
-			local success, errorMessage =
-				pcall(function()
-					checkMovement(
-						state,
-						character,
-						humanoid,
-						root
-					)
+		if character and humanoid and root then
+			local success, err = pcall(function()
+				checkMovement(
+					state,
+					character,
+					humanoid,
+					root
+				)
 
-					checkAirTime(
-						state,
-						character,
-						humanoid,
-						root
-					)
+				checkAirTime(
+					state,
+					character,
+					root
+				)
 
-					checkNoclip(
-						state,
-						character,
-						root
-					)
-				end)
+				checkNoclip(
+					state,
+					character,
+					root
+				)
+			end)
 
 			if not success then
 				warn(
 					"[Sentinel] Check error:",
-					errorMessage
+					err
 				)
 			end
 		end
@@ -700,5 +622,6 @@ for _, player in ipairs(
 end
 
 print(
-	"[Sentinel] Anti-cheat online."
+	"[Sentinel] Anti-cheat online | Session:",
+	Workspace:GetAttribute("SentinelSession")
 )
